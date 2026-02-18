@@ -1,31 +1,28 @@
 import io
 import re
-import math
 import pandas as pd
 import numpy as np
 import streamlit as st
-from rapidfuzz import fuzz, process
+
+# rapidfuzz ist optional – App läuft auch ohne
+try:
+    from rapidfuzz import fuzz, process  # noqa: F401
+    RAPIDFUZZ_OK = True
+except Exception:
+    RAPIDFUZZ_OK = False
+
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
 
+
 st.set_page_config(page_title="KI Kosten-Scanner (CSV)", layout="wide")
 
-# ----------------------------
-# Helpers
-# ----------------------------
-EXPECTED_COLS = [
-    "date / data",
-    "amount_net / importo_netto",
-    "vendor_raw / fornitore_originale",
-    "account / conto",
-    "text / descrizione",
-    "vat_rate / aliquota_iva",
-    "document_no / numero_documento",
-    "cost_center / centro_di_costo",
-]
 
+# ----------------------------
+# Konfiguration
+# ----------------------------
 SAVING_RATES = {
     "Leasing/Fahrzeug": 0.05,
     "Marketing/Werbung": 0.15,
@@ -36,9 +33,16 @@ SAVING_RATES = {
     "Sonstiges": 0.10,
 }
 
+REQUIRED_KEYS = ["date", "amount", "vendor"]
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
 def parse_date(s):
-    # accepts YYYY-MM-DD or DD.MM.YYYY
+    # akzeptiert YYYY-MM-DD oder DD.MM.YYYY usw.
     return pd.to_datetime(s, errors="coerce", dayfirst=True)
+
 
 def norm_vendor(v: str) -> str:
     if not isinstance(v, str):
@@ -48,6 +52,7 @@ def norm_vendor(v: str) -> str:
     v = v.replace("&", " und ")
     v = re.sub(r"[^a-z0-9äöüßàèéìòù \-\.]", "", v)
     return v.strip()
+
 
 def categorize(vendor_norm: str, account: str, text: str) -> str:
     n = (vendor_norm or "").lower()
@@ -60,20 +65,19 @@ def categorize(vendor_norm: str, account: str, text: str) -> str:
         return "Marketing/Werbung"
     if "hera" in n or "alperia" in n or "energie" in t or "strom" in t or "gas" in t:
         return "Energie"
-    if "aruba" in n or "register" in n or "apple" in n or "microsoft" in n or "google" in n or "adobe" in n:
+    if any(x in n for x in ["aruba", "register", "apple", "microsoft", "google", "adobe"]):
         return "Software/IT"
     if "gemeinde" in n or "handelskammer" in n or "camera di commercio" in t:
         return "Gebühren/Pflicht"
     if "rst" in n or "steuer" in t or "commercialista" in t:
         return "Beratung/Dienstleistung"
 
-    # Konto-Hints (wenn bei euch vorhanden)
+    # Konto-Hints (falls vorhanden)
     if a.startswith("71.") or "software" in a:
         return "Software/IT"
-    if "versicherung" in t or "assicur" in t:
-        return "Sonstiges"
 
     return "Sonstiges"
+
 
 def guess_frequency(dates: pd.Series) -> str:
     dates = dates.dropna().sort_values()
@@ -93,6 +97,7 @@ def guess_frequency(dates: pd.Series) -> str:
         return "jährlich"
     return "unklar"
 
+
 def build_pdf(summary_rows: list[tuple], title="Pilotreport – Kosten-Scanner"):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4)
@@ -106,31 +111,79 @@ def build_pdf(summary_rows: list[tuple], title="Pilotreport – Kosten-Scanner")
     data = [["Kennzahl", "Wert"]] + [[k, v] for (k, v) in summary_rows]
     table = Table(data, colWidths=[260, 260])
     table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
     elements.append(table)
     doc.build(elements)
     buf.seek(0)
     return buf
 
+
+def read_csv_auto(raw_bytes: bytes) -> pd.DataFrame:
+    """
+    Robust: erkennt Trennzeichen , oder ; automatisch.
+    """
+    # Versuch 1: pandas autodetect
+    try:
+        return pd.read_csv(io.BytesIO(raw_bytes), sep=None, engine="python")
+    except Exception:
+        pass
+
+    # Versuch 2: explizit ;
+    try:
+        return pd.read_csv(io.BytesIO(raw_bytes), sep=";")
+    except Exception:
+        pass
+
+    # Versuch 3: explizit ,
+    return pd.read_csv(io.BytesIO(raw_bytes), sep=",")
+
+
+def auto_map_columns(df: pd.DataFrame) -> dict:
+    """
+    Mappt CSV-Spalten automatisch auf interne Keys:
+    date, amount, vendor, account, text
+    """
+    col_map = {}
+    for c in df.columns:
+        lc = str(c).strip().lower()
+
+        if ("date" in lc) or ("datum" in lc) or ("data" in lc):
+            col_map["date"] = c
+
+        if ("amount" in lc) or ("importo" in lc) or ("betrag" in lc) or ("netto" in lc):
+            col_map["amount"] = c
+
+        if ("vendor" in lc) or ("fornitore" in lc) or ("lieferant" in lc) or ("empfänger" in lc) or ("empfaenger" in lc):
+            col_map["vendor"] = c
+
+        if ("account" in lc) or ("konto" in lc) or ("conto" in lc):
+            col_map["account"] = c
+
+        if ("text" in lc) or ("descrizione" in lc) or ("beschreibung" in lc) or ("verwendungszweck" in lc):
+            col_map["text"] = c
+
+    return col_map
+
+
 # ----------------------------
 # UI
 # ----------------------------
 st.title("KI Kosten-Scanner – CSV Upload (internes MVP)")
 
-with st.expander("CSV-Anforderungen (DE/IT)", expanded=False):
+with st.expander("Hinweise", expanded=False):
     st.markdown(
-        "- Nutze idealerweise das zweisprachige Template.\n"
-        "- Pflichtspalten: **date / data**, **amount_net / importo_netto**, **vendor_raw / fornitore_originale**\n"
-        "- Betrag netto als Zahl (Aufwand positiv)."
+        "- Betrag netto als Zahl (Aufwand **positiv**).\n"
+        "- App erkennt Trennzeichen `,` und `;` automatisch.\n"
+        "- `rapidfuzz` ist optional (Vendor-Matching später)."
     )
 
 uploaded = st.file_uploader("CSV hochladen", type=["csv"])
 
-colA, colB = st.columns([2,1])
+colA, colB = st.columns([2, 1])
 with colB:
     year_min = st.number_input("Startjahr (Filter)", value=2023, step=1)
     year_max = st.number_input("Endjahr (Filter)", value=2025, step=1)
@@ -141,91 +194,94 @@ if not uploaded:
     st.info("Bitte CSV hochladen, um die Analyse zu starten.")
     st.stop()
 
-# Read CSV (auto separator)
 raw = uploaded.read()
 try:
-    df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
+    df = read_csv_auto(raw)
 except Exception:
     st.error("CSV konnte nicht gelesen werden. Bitte Trennzeichen/Encoding prüfen.")
     st.stop()
 
-# Try to auto-map columns if using template
-col_map = {}
-for c in df.columns:
-    lc = c.strip().lower()
-    if "date" in lc or "data" in lc:
-        col_map["date"] = c
-    if "amount" in lc or "importo" in lc:
-        col_map["amount"] = c
-    if "vendor" in lc or "fornitore" in lc:
-        col_map["vendor"] = c
-    if "account" in lc or "conto" in lc:
-        col_map["account"] = c
-    if "text" in lc or "descrizione" in lc:
-        col_map["text"] = c
-
-missing = [k for k in ["date","amount","vendor"] if k not in col_map]
+col_map = auto_map_columns(df)
+missing = [k for k in REQUIRED_KEYS if k not in col_map]
 if missing:
-    st.error(f"Fehlende Spalten (oder nicht erkannt): {missing}. Benenne Spalten wie im Template.")
+    st.error(f"Fehlende Spalten (oder nicht erkannt): {missing}. Bitte Spaltennamen prüfen.")
+    st.write("Erkannte Spalten:", list(df.columns))
     st.stop()
 
-# Normalize dataframe
+# Normalisiertes DataFrame
 d = pd.DataFrame()
 d["date"] = df[col_map["date"]].apply(parse_date)
 d["year"] = d["date"].dt.year
 d["amount_net"] = pd.to_numeric(df[col_map["amount"]], errors="coerce").fillna(0.0)
 d["vendor_raw"] = df[col_map["vendor"]].astype(str)
-d["account"] = df[col_map.get("account","")].astype(str) if col_map.get("account") in df.columns else ""
-d["text"] = df[col_map.get("text","")].astype(str) if col_map.get("text") in df.columns else ""
 
-# Filter years and expenses
+if "account" in col_map and col_map["account"] in df.columns:
+    d["account"] = df[col_map["account"]].astype(str)
+else:
+    d["account"] = ""
+
+if "text" in col_map and col_map["text"] in df.columns:
+    d["text"] = df[col_map["text"]].astype(str)
+else:
+    d["text"] = ""
+
+# Filter: Jahre + Aufwand
 d = d[(d["year"].between(year_min, year_max)) & (d["amount_net"] > 0)].copy()
 if d.empty:
     st.warning("Nach Filterung ist keine Datenzeile übrig (Jahre/Beträge prüfen).")
     st.stop()
 
+# Normalisierung + Kategorie
 d["vendor_norm"] = d["vendor_raw"].apply(norm_vendor)
 d["category"] = d.apply(lambda r: categorize(r["vendor_norm"], r["account"], r["text"]), axis=1)
+
 
 # ----------------------------
 # 1) Fixkosten / recurring detection
 # ----------------------------
-vendor_year = d.groupby(["vendor_norm","year"], as_index=False).agg(
-    sum_net=("amount_net","sum"),
-    count=("amount_net","size"),
+vendor_year = d.groupby(["vendor_norm", "year"], as_index=False).agg(
+    sum_net=("amount_net", "sum"),
+    count=("amount_net", "size"),
 )
+
 pivot = vendor_year.pivot(index="vendor_norm", columns="year", values="sum_net").fillna(0.0)
-pivot_counts = vendor_year.pivot(index="vendor_norm", columns="year", values="count").fillna(0.0)
+
 years = sorted([y for y in pivot.columns if isinstance(y, (int, np.integer))])
+if not years:
+    st.error("Keine Jahresdaten gefunden. Prüfe Datumsspalte.")
+    st.stop()
 
 total = pivot.sum(axis=1).rename("total").to_frame()
 years_nonzero = (pivot > 0).sum(axis=1).rename("years_nonzero").to_frame()
 recurring = total.join(years_nonzero)
-recurring["latest_year"] = max(years) if years else None
-recurring["latest_cost"] = pivot[recurring["latest_year"]] if years else 0.0
-recurring = recurring.sort_values("total", ascending=False)
 
-# add freq guess using raw dates for vendors
-freq_map = {}
-for v, grp in d.groupby("vendor_norm"):
-    freq_map[v] = guess_frequency(grp["date"])
+# ✅ FIX: latest_year als einzelne Zahl, nicht als Spalte verwenden
+latest_year = max(years)
+recurring["latest_year"] = latest_year
+recurring["latest_cost"] = pivot[latest_year]
+
+# Frequenz-Schätzung
+freq_map = {v: guess_frequency(grp["date"]) for v, grp in d.groupby("vendor_norm")}
 recurring["freq_guess"] = recurring.index.map(freq_map)
 
-# add category (most common)
+# Kategorie (häufigste pro Anbieter)
 cat_map = d.groupby("vendor_norm")["category"].agg(lambda x: x.value_counts().index[0])
 recurring["category"] = recurring.index.map(cat_map)
 
-# Heuristic recurring flag
-recurring["recurring_flag"] = (recurring["years_nonzero"] >= 2) | (recurring["freq_guess"].isin(["monatlich","quartal","zweimonatlich","jährlich"]))
-recurring_view = recurring.reset_index().rename(columns={"vendor_norm":"anbieter"})
+# Heuristik: recurring flag
+recurring["recurring_flag"] = (
+    (recurring["years_nonzero"] >= 2)
+    | (recurring["freq_guess"].isin(["monatlich", "quartal", "zweimonatlich", "jährlich"]))
+)
+
+recurring_view = recurring.reset_index().rename(columns={"vendor_norm": "anbieter"})
+
+trend = recurring_view[["anbieter", "category"] + years + ["total", "years_nonzero", "freq_guess", "recurring_flag"]].copy()
+trend = trend.sort_values("total", ascending=False)
+
 
 # ----------------------------
-# 2) Trend table (top)
-# ----------------------------
-trend = recurring_view[["anbieter","category"] + years + ["total","years_nonzero","freq_guess","recurring_flag"]].copy()
-
-# ----------------------------
-# 3) Alarms
+# 2) Alarme
 # ----------------------------
 alarms = []
 TH = float(alarm_threshold_pct)
@@ -236,6 +292,7 @@ for v in pivot.index:
     for y1, y2 in zip(years[:-1], years[1:]):
         base = float(row.get(y1, 0.0))
         new = float(row.get(y2, 0.0))
+
         if base == 0 and new >= MIN:
             alarms.append((v, f"{y1}->{y2}", "NEU", base, new, new, None))
         elif base >= MIN and new == 0:
@@ -243,47 +300,41 @@ for v in pivot.index:
         elif base >= MIN and new > 0:
             pct = (new - base) / base * 100.0
             if abs(pct) >= TH:
-                alarms.append((v, f"{y1}->{y2}", "ÄNDERUNG", base, new, new-base, pct))
+                alarms.append((v, f"{y1}->{y2}", "ÄNDERUNG", base, new, new - base, pct))
 
-alarms_df = pd.DataFrame(alarms, columns=["anbieter","periode","typ","basis","neu","delta","pct"])
+alarms_df = pd.DataFrame(alarms, columns=["anbieter", "periode", "typ", "basis", "neu", "delta", "pct"])
 if not alarms_df.empty:
     alarms_df["category"] = alarms_df["anbieter"].map(cat_map).fillna("Sonstiges")
     alarms_df = alarms_df.sort_values(["periode", "delta"], ascending=[True, False])
 
+
 # ----------------------------
-# 4) Savings potential (latest year)
+# 3) Einsparpotenzial (letztes Jahr)
 # ----------------------------
-latest_year = max(years) if years else None
-savings = vendor_year[vendor_year["year"] == latest_year].copy() if latest_year else vendor_year.copy()
+savings = vendor_year[vendor_year["year"] == latest_year].copy()
 savings["category"] = savings["vendor_norm"].map(cat_map).fillna("Sonstiges")
 savings["rate"] = savings["category"].map(SAVING_RATES).fillna(0.10)
 savings["potential_eur"] = (savings["sum_net"] * savings["rate"]).round(2)
 savings = savings.sort_values("potential_eur", ascending=False)
 
-# Summary metrics
-relevant_cost = float(savings["sum_net"].sum()) if latest_year else float(vendor_year["sum_net"].sum())
-potential_total = float(savings["potential_eur"].sum()) if latest_year else 0.0
+relevant_cost = float(savings["sum_net"].sum())
+potential_total = float(savings["potential_eur"].sum())
 potential_pct = (potential_total / relevant_cost * 100.0) if relevant_cost > 0 else 0.0
 
+
 # ----------------------------
-# UI tabs
+# UI Tabs
 # ----------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["Fixkosten", "Trends", "Alarme", "Einsparpotenzial"])
 
 with tab1:
     st.subheader("Fixkosten / Wiederkehrende Anbieter")
     st.caption("Heuristik: ≥2 Jahre vorhanden ODER Frequenz-Schätzung (monatlich/quartal/jährlich).")
-    st.dataframe(
-        trend.sort_values("total", ascending=False).head(50),
-        use_container_width=True
-    )
+    st.dataframe(trend.head(100), use_container_width=True)
 
 with tab2:
-    st.subheader("Trendanalyse")
-    st.dataframe(
-        trend.sort_values("total", ascending=False).head(50),
-        use_container_width=True
-    )
+    st.subheader("Trendanalyse (Top)")
+    st.dataframe(trend.head(100), use_container_width=True)
 
 with tab3:
     st.subheader("Alarm-Liste")
@@ -298,18 +349,23 @@ with tab4:
     st.metric("Relevante Kosten", f"{relevant_cost:,.2f} €")
     st.metric("Einsparpotenzial (Schätzung)", f"{potential_total:,.2f} €")
     st.metric("Potenzialquote", f"{potential_pct:.1f} %")
-    st.dataframe(savings.rename(columns={
-        "vendor_norm":"anbieter",
-        "sum_net":"kosten",
-        "count":"buchungen"
-    })[["anbieter","category","kosten","rate","potential_eur","buchungen"]].head(50), use_container_width=True)
+    st.dataframe(
+        savings.rename(columns={
+            "vendor_norm": "anbieter",
+            "sum_net": "kosten",
+            "count": "buchungen",
+        })[["anbieter", "category", "kosten", "rate", "potential_eur", "buchungen"]].head(100),
+        use_container_width=True
+    )
 
-# Downloads
 st.divider()
-col1, col2, col3 = st.columns([1,1,2])
+
+# ----------------------------
+# Downloads
+# ----------------------------
+col1, col2, col3 = st.columns([1, 1, 2])
 
 with col1:
-    # Excel export
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         trend.to_excel(writer, index=False, sheet_name="trends_fixkosten")
@@ -322,15 +378,17 @@ with col1:
 with col2:
     pdf_buf = build_pdf([
         ("Zeitraum", f"{year_min}–{year_max}"),
+        ("Letztes Jahr", str(latest_year)),
         ("Relevante Kosten (letztes Jahr)", f"{relevant_cost:,.2f} €"),
         ("Einsparpotenzial (konservativ)", f"{potential_total:,.2f} €"),
         ("Potenzialquote", f"{potential_pct:.1f} %"),
         ("Alarme", str(len(alarms_df)) if not alarms_df.empty else "0"),
+        ("rapidfuzz verfügbar", "ja" if RAPIDFUZZ_OK else "nein"),
     ], title="Pilotreport – Kosten-Scanner (internes MVP)")
     st.download_button("Kurzreport als PDF", data=pdf_buf, file_name="pilotreport_kosten_scanner.pdf")
 
 with col3:
     st.info(
-        "Hinweis: Kategorien/Einsparquoten sind MVP-Heuristiken. "
-        "In der Kanzlei-Version sollte es eine Berater-Override-Funktion geben (Mapping & Quoten pro Mandant)."
+        "MVP-Hinweis: Kategorien & Einsparquoten sind Heuristiken. "
+        "Nächster Schritt: Vendor-Mapping-UI (Zusammenführen/Overrides) + mandantenspezifische Quoten."
     )
